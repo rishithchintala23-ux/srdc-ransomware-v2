@@ -1,6 +1,6 @@
 # ============================================================
-# process.py — Convert Sgandurra dataset → 7 text columns
-# Handles the exact format of VariableNames.txt
+# process.py — Convert Sgandurra binary features → text
+# Dataset has no headers — we load them from VariableNames.txt
 # ============================================================
 
 import pandas as pd
@@ -8,155 +8,151 @@ import re
 import os
 from tqdm import tqdm
 
-# ── Load column names from VariableNames.txt ─────────────────
-def load_column_names(var_path: str) -> list:
-    """
-    VariableNames.txt format:
-      1;ID
-      2;Label (1 Ransomware / 0 Goodware)
-      3;Ransomware Family
-      4;API:GetSystemDirectoryA
-      30966;STR:16263;MP_PERSISTEDSTORE_NOTIFY_DISABLE
-              ↑ STR cols have extra internal index — strip it!
-    """
-    cols = []
-    with open(var_path, encoding='latin-1') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split(';', 1)          # split on FIRST ; only
-            name  = parts[1] if len(parts) > 1 else parts[0]
-
-            # STR columns: "STR:16263;MP_PERSIST..." → "STR:MP_PERSIST..."
-            if name.upper().startswith('STR:'):
-                after = name[4:]                # remove "STR:"
-                # if next part looks like a number;name, strip the number
-                sub = after.split(';', 1)
-                if len(sub) == 2 and sub[0].isdigit():
-                    name = 'STR:' + sub[1]
-
-            cols.append(name)
-    return cols
-
-# ── Text helpers ──────────────────────────────────────────────
-def camel_to_words(name: str) -> str:
+def camel_to_words(name):
     name = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', name)
     name = re.sub(r'([a-z\d])([A-Z])',      r'\1 \2', name)
     return name.lower().strip()
 
-def strip_suffix(name: str) -> str:
+def strip_suffix(name):
     if len(name) > 2 and name[-1] in ('W','A') and name[-2].islower():
         return name[:-1]
     return name
 
-def col_to_phrase(col: str) -> str:
-    u = col.upper()
+def col_to_phrase(col_name):
+    col = col_name.strip()
+    u   = col.upper()
     if u.startswith('API:'):
-        return camel_to_words(strip_suffix(col[4:]))
+        return camel_to_words(strip_suffix(col.split(':',1)[1]))
     if u.startswith('REG:'):
-        parts = col.split(':', 2)
-        verb  = parts[1].lower() if len(parts) > 1 else 'accessed'
-        key   = parts[2].replace('\\', ' ') if len(parts) > 2 else ''
+        parts = col.split(':',2)
+        verb  = parts[1].lower() if len(parts)>1 else 'accessed'
+        key   = parts[2].replace('\\',' ') if len(parts)>2 else ''
         return f"{verb} registry {key}".strip()
     if u.startswith('FILES:') or u.startswith('FILE:'):
-        parts = col.split(':', 2)
-        verb  = parts[1].lower() if len(parts) > 1 else 'accessed'
-        path  = parts[2] if len(parts) > 2 else ''
+        parts = col.split(':',2)
+        verb  = parts[1].lower() if len(parts)>1 else 'accessed'
+        path  = parts[2].replace('\\',' ') if len(parts)>2 else ''
         return f"{verb} file {path}".strip()
     if u.startswith('DROP:'):
-        return f"dropped file {col[5:]}".strip()
+        return f"dropped file {col.split(':',1)[1]}".strip()
     if u.startswith('DIR:'):
-        parts = col.split(':', 2)
-        verb  = parts[1].lower() if len(parts) > 1 else 'accessed'
-        path  = parts[2] if len(parts) > 2 else ''
+        parts = col.split(':',2)
+        verb  = parts[1].lower() if len(parts)>1 else 'accessed'
+        path  = parts[2].replace('\\',' ') if len(parts)>2 else ''
         return f"{verb} directory {path}".strip()
     if u.startswith('EXT:'):
-        return f"opened extension {col[4:].lstrip('.')}"
+        return f"opened extension {col.split(':',1)[1].lstrip('.')}"
     if u.startswith('STR:'):
-        return col[4:].lower().replace('_', ' ').replace(';', ' ')
+        raw = col.split(':',1)[1]
+        val = raw.split(';',1)[-1] if ';' in raw else raw
+        return val.lower().strip()
     return camel_to_words(col)
 
-def get_category(col: str) -> str:
-    u = col.upper()
-    if u.startswith('API:'):   return 'api'
+def get_category(col_name):
+    u = col_name.upper()
+    if u.startswith('API:'):                             return 'api'
     if u.startswith('FILES:') or u.startswith('FILE:'): return 'files'
-    if u.startswith('EXT:'):   return 'ext'
-    if u.startswith('REG:'):   return 'reg'
-    if u.startswith('DIR:'):   return 'dir'
-    if u.startswith('DROP:'):  return 'drop'
+    if u.startswith('EXT:'):                             return 'ext'
+    if u.startswith('REG:'):                             return 'reg'
+    if u.startswith('DIR:'):                             return 'dir'
+    if u.startswith('DROP:'):                            return 'drop'
     return 'str'
 
-# ── Main ──────────────────────────────────────────────────────
-def process_dataset(csv_path: str, var_path: str, out_path: str):
-    print("Loading column names...")
-    all_cols = load_column_names(var_path)
-    print(f"Total columns: {len(all_cols)}")
-    print(f"First 5: {all_cols[:5]}")
-    print(f"Last  5: {all_cols[-5:]}")
+def load_variable_names(path):
+    names = []
+    with open(path, encoding='latin-1') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(';', 1)
+            name  = parts[1] if len(parts) > 1 else parts[0]
+            names.append(name)
+    return names
+
+def process_dataset(input_csv, varnames_txt, output_path):
+    print("Loading variable names...")
+    col_names = load_variable_names(varnames_txt)
+    print(f"Total columns: {len(col_names)}")
+    print(f"First 3: {col_names[:3]}")
 
     print("\nLoading dataset...")
-    df = pd.read_csv(csv_path, header=None, names=all_cols)
+    df = pd.read_csv(input_csv, header=None, names=col_names)
     print(f"Shape: {df.shape}")
 
-    # First 3 cols are metadata
-    label_cols   = ['ID',
-                    'Label (1 Ransomware / 0 Goodware)',
-                    'Ransomware Family']
-    feature_cols = [c for c in all_cols if c not in label_cols]
-    print(f"Feature cols: {len(feature_cols)}")
+    # Rename first 3 columns
+    df.columns.values[0] = 'sample_id'
+    df.columns.values[1] = 'label'
+    df.columns.values[2] = 'family'
 
-    # Pre-compute phrase for each feature column
-    print("\nPre-computing phrases...")
-    col_info = {
-        c: {'cat': get_category(c), 'phrase': col_to_phrase(c)}
-        for c in tqdm(feature_cols)
+    # Check if row 0 is a header row (non-numeric)
+    try:
+        float(df.iloc[0, 3])
+    except:
+        print("Dropping header row...")
+        df = df.iloc[1:].reset_index(drop=True)
+
+    feature_cols = list(df.columns[3:])
+    print(f"Feature columns: {len(feature_cols)}")
+
+    family_map = {
+        0:'Goodware', 1:'Citroni', 2:'CryptLocker',
+        3:'CryptoWall', 4:'KOLLAH', 5:'Kovter',
+        6:'Locker', 7:'MATSNU', 8:'PGPCODER',
+        9:'Reveton', 10:'TeslaCrypt', 11:'TrojanRansom'
     }
+    df['family']      = pd.to_numeric(df['family'], errors='coerce').fillna(0).astype(int)
+    df['label']       = pd.to_numeric(df['label'],  errors='coerce').fillna(0).astype(int)
+    df['family_name'] = df['family'].map(family_map).fillna('Unknown')
 
-    # Verify categories
-    from collections import Counter
-    cats_count = Counter(v['cat'] for v in col_info.values())
-    print("Category counts:", dict(cats_count))
+    print("\nPre-computing feature phrases...")
+    col_info = {}
+    for col in tqdm(feature_cols):
+        col_info[col] = {
+            'category': get_category(col),
+            'phrase':   col_to_phrase(col)
+        }
 
-    # Build 7 text strings per sample
+    cats = ['api','files','ext','reg','dir','drop','str']
     print("\nBuilding text features...")
-    CATS = ['api', 'files', 'ext', 'reg', 'dir', 'drop', 'str']
     records = []
-
     for idx, row in tqdm(df.iterrows(), total=len(df)):
-        active = [c for c in feature_cols if row[c] == 1]
-        groups = {c: [] for c in CATS}
-        for c in active:
-            info = col_info[c]
-            groups[info['cat']].append(info['phrase'])
+        groups = {c: [] for c in cats}
+        for col in feature_cols:
+            try:
+                if int(row[col]) == 1:
+                    info = col_info[col]
+                    groups[info['category']].append(info['phrase'])
+            except:
+                pass
 
         record = {
-            'label':       int(row['Label (1 Ransomware / 0 Goodware)']),
-            'family':      int(row['Ransomware Family']),
+            'sample_id':   row['sample_id'],
+            'label':       row['label'],
+            'family':      row['family'],
+            'family_name': row['family_name'],
         }
-        for cat in CATS:
+        for cat in cats:
             record[f'{cat}Features'] = (
                 ' , '.join(groups[cat]) if groups[cat] else 'no activity'
             )
         records.append(record)
 
     out_df = pd.DataFrame(records)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    out_df.to_csv(out_path, index=False)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    out_df.to_csv(output_path, index=False)
 
-    print(f"\nSaved: {out_path}")
+    print(f"\nSaved: {output_path}")
     print(f"Shape: {out_df.shape}")
-    print(f"\nLabel distribution:")
-    print(out_df['label'].value_counts())
     print(f"\nFamily distribution:")
-    print(out_df['family'].value_counts().sort_index())
-    print(f"\nSample apiFeatures row 0:")
-    print(out_df['apiFeatures'].iloc[0][:300])
+    print(out_df['family_name'].value_counts())
+    print(f"\nSample apiFeatures row 1:")
+    print(out_df['apiFeatures'].iloc[1][:300])
     return out_df
 
 if __name__ == "__main__":
     process_dataset(
-        csv_path = "data/raw/RansomwareData.csv",
-        var_path = "data/raw/VariableNames.txt",
-        out_path = "data/processed/processed.csv",
+        input_csv    = "data/raw/RansomwareData.csv",
+        varnames_txt = "data/raw/VariableNames.txt",
+        output_path  = "data/processed/processed.csv"
     )
