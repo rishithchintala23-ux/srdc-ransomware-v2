@@ -59,11 +59,10 @@ def make_class_weights(labels, num_classes, power=CLASS_WEIGHT_POWER):
     w = (1.0 / counts) ** power
     return w / w.mean()
 
-
 def build_model(num_classes):
-    return AutoModelForSequenceClassification.from_pretrained(
+    model = AutoModelForSequenceClassification.from_pretrained(
         MODEL_NAME, num_labels=num_classes)
-
+    return model.float()   # checkpoint is fp16; AMP needs fp32 master weights
 
 @torch.no_grad()
 def predict(model, dataset, device, batch_size=32):
