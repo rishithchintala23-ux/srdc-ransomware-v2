@@ -1,183 +1,327 @@
 # ============================================================
-# train.py — Fine-tune DeBERTa-v3 on ransomware dataset
+# train.py - Fine-tune DeBERTa-v3 for SRDC v2   (RUN ON COLAB, T4 GPU)
 #
-# WHAT FINE-TUNING MEANS:
-#   DeBERTa-v3 was pre-trained on 160GB of text.
-#   It already understands English deeply.
-#   Fine-tuning = update its weights on OUR specific task
-#   (ransomware classification) with a small learning rate.
-#   Result: DeBERTa learns ransomware patterns fast.
+# TASK 1  family   12-class family classification, 4-fold stratified CV
+# TASK 2  binary   zero-day detection: train on SEEN families + goodware,
+#                  test on UNSEEN families + goodware (paper's Table 7 split)
 #
-# WHY SMALL LEARNING RATE (2e-5):
-#   Large LR = destroy pre-trained knowledge (catastrophic forgetting)
-#   Small LR = gently update toward ransomware understanding
+# Usage (from project root):
+#   python model/train.py --task binary                 # Task 2, saves model
+#   python model/train.py --task family                 # Task 1, all 4 folds
+#   python model/train.py --task family --folds 0,1     # only some folds
+#   python model/train.py --task family --summarize     # pool saved folds
+#   python model/train.py --task family --full          # train on ALL data, save
 #
-# RUN ON GOOGLE COLAB (T4 GPU):
-#   Runtime → Change runtime → T4 GPU
-#   Then run: python model/train.py
+# No best-epoch selection on the test data: we train a fixed number of
+# epochs and report the LAST epoch, so results are not inflated.
 # ============================================================
 
-import os, sys
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+import argparse
+import glob
+import json
+import math
+import os
+import random
+import sys
 
-import torch
 import numpy as np
-from transformers import (
-    AutoTokenizer,
-    AutoModelForSequenceClassification,
-    TrainingArguments,
-    Trainer,
-    EarlyStoppingCallback,
-)
-from sklearn.metrics import balanced_accuracy_score, f1_score
-from sklearn.model_selection import train_test_split
-from torch.utils.data import Subset
 import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
+                             f1_score, precision_score, recall_score)
+from sklearn.model_selection import StratifiedKFold
+from torch.utils.data import DataLoader, Subset
+from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
+                          get_linear_schedule_with_warmup)
 
-from model.config import *
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from model.config import *            # noqa: F401,F403
 from data.dataset import RansomwareDataset
 
-# ── Metrics ──────────────────────────────────────────────────
-def compute_metrics(eval_pred):
-    """
-    Called after each epoch to evaluate the model.
 
-    WHY BALANCED ACCURACY:
-    Dataset is imbalanced (942 goodware, 4 PGPCODER).
-    Regular accuracy would give 99% by predicting everything
-    as goodware. Balanced accuracy treats all classes equally.
-    """
-    logits, labels = eval_pred
-    preds = np.argmax(logits, axis=1)
-    bal_acc = balanced_accuracy_score(labels, preds)
-    f1      = f1_score(labels, preds, average='weighted',
-                       zero_division=0)
-    return {
-        'balanced_accuracy': bal_acc,
-        'f1_weighted':       f1,
-    }
+# ------------------------------------------------------------
+# helpers
+# ------------------------------------------------------------
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-def train(task: str = 'family'):
-    """
-    Fine-tune DeBERTa-v3 for ransomware classification.
 
-    Args:
-        task: 'family' (12-class) or 'binary' (2-class)
-    """
-    print("="*60)
-    print(f"SRDC v2 — Fine-tuning DeBERTa-v3")
-    print(f"Task: {task}")
-    print(f"Model: {MODEL_NAME}")
-    print("="*60)
+def make_class_weights(labels, num_classes, power=CLASS_WEIGHT_POWER):
+    """weight_c = (1/count_c)**power, normalised to mean 1.
+    Goodware(942) vs PGPCODER(4) is a >200x imbalance; sqrt-inverse
+    weighting (power 0.5) lifts rare classes without exploding the loss."""
+    counts = np.bincount(labels, minlength=num_classes).astype(float)
+    counts[counts == 0] = 1.0
+    w = (1.0 / counts) ** power
+    return w / w.mean()
 
-    # ── Step 1: Load tokenizer ────────────────────────────────
-    # WHY TOKENIZER:
-    # Converts text → token IDs DeBERTa understands
-    # Example: "crypt encrypt" → [2, 15234, 9821, 3]
-    print("\n[1/5] Loading DeBERTa tokenizer...")
+
+def build_model(num_classes):
+    return AutoModelForSequenceClassification.from_pretrained(
+        MODEL_NAME, num_labels=num_classes)
+
+
+@torch.no_grad()
+def predict(model, dataset, device, batch_size=32):
+    model.eval()
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    use_amp = device.type == 'cuda'
+    preds = []
+    for batch in loader:
+        ids = batch['input_ids'].to(device)
+        mask = batch['attention_mask'].to(device)
+        with torch.autocast(device_type=device.type, dtype=torch.float16,
+                            enabled=use_amp):
+            logits = model(input_ids=ids, attention_mask=mask).logits
+        preds.extend(logits.argmax(dim=-1).cpu().tolist())
+    return np.array(preds)
+
+
+def train_model(model, train_ds, class_weights, device, epochs):
+    """Fixed-epoch fine-tuning with class-weighted CE, AMP, warmup + linear decay."""
+    model.to(device)
+    loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    steps_per_epoch = math.ceil(len(loader) / GRAD_ACCUM)
+    total_steps = steps_per_epoch * epochs
+
+    no_decay = ('bias', 'LayerNorm.weight')
+    groups = [
+        {'params': [p for n, p in model.named_parameters()
+                    if not any(nd in n for nd in no_decay)],
+         'weight_decay': WEIGHT_DECAY},
+        {'params': [p for n, p in model.named_parameters()
+                    if any(nd in n for nd in no_decay)],
+         'weight_decay': 0.0},
+    ]
+    optimizer = torch.optim.AdamW(groups, lr=LEARNING_RATE)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, int(WARMUP_RATIO * total_steps), total_steps)
+
+    use_amp = device.type == 'cuda'
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    loss_fn = nn.CrossEntropyLoss(
+        weight=torch.tensor(class_weights, dtype=torch.float, device=device))
+
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        running, seen = 0.0, 0
+        for step, batch in enumerate(loader):
+            ids = batch['input_ids'].to(device)
+            mask = batch['attention_mask'].to(device)
+            y = batch['label'].to(device)
+
+            with torch.autocast(device_type=device.type, dtype=torch.float16,
+                                enabled=use_amp):
+                logits = model(input_ids=ids, attention_mask=mask).logits
+            loss = loss_fn(logits.float(), y) / GRAD_ACCUM
+            scaler.scale(loss).backward()
+
+            if (step + 1) % GRAD_ACCUM == 0 or (step + 1) == len(loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+
+            running += loss.item() * GRAD_ACCUM * len(y)
+            seen += len(y)
+        print(f"  epoch {epoch + 1}/{epochs}  train loss {running / seen:.4f}")
+    return model
+
+
+def free_gpu(*objs):
+    for o in objs:
+        del o
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def per_class_recall(y_true, y_pred):
+    out = {}
+    for c, name in FAMILY_MAP.items():
+        mask = y_true == c
+        if mask.sum() > 0:
+            out[name] = round(float((y_pred[mask] == c).mean()), 4)
+    return out
+
+
+# ------------------------------------------------------------
+# TASK 1: family classification, stratified k-fold CV
+# ------------------------------------------------------------
+def summarize_cv(n_samples):
+    """Pool whatever fold files exist into one out-of-fold report."""
+    files = sorted(glob.glob(os.path.join(OUTPUT_DIR, 'cv', 'fold*.json')))
+    if not files:
+        print("No fold results found in outputs/cv/.")
+        return None
+    y_true, y_pred, fold_scores = [], [], {}
+    for f in files:
+        d = json.load(open(f))
+        y_true += d['y_true']
+        y_pred += d['y_pred']
+        fold_scores[d['fold']] = d['balanced_accuracy']
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    pooled = balanced_accuracy_score(y_true, y_pred)
+
+    print("\n" + "=" * 60)
+    print(f"TASK 1 RESULTS  ({len(files)}/{CV_FOLDS} folds, {len(y_true)}/{n_samples} samples)")
+    print("=" * 60)
+    for k in sorted(fold_scores):
+        print(f"  fold {k}: balanced acc {fold_scores[k] * 100:.2f}%")
+    print(f"Pooled balanced accuracy: {pooled * 100:.2f}%")
+    print(f"Paper target:             {PAPER_TASK1_BALANCED_ACC * 100:.2f}%")
+    print("Per-class recall:")
+    for name, r in per_class_recall(y_true, y_pred).items():
+        print(f"  {name:14s} {r:.3f}")
+    if len(files) == CV_FOLDS and pooled > PAPER_TASK1_BALANCED_ACC:
+        print("STATUS: BEATS PAPER")
+    result = {'pooled_balanced_accuracy': pooled, 'folds': fold_scores,
+              'per_class_recall': per_class_recall(y_true, y_pred)}
+    json.dump(result, open(os.path.join(OUTPUT_DIR, 'results_family.json'), 'w'), indent=2)
+    return result
+
+
+def run_family_cv(dataset, device, epochs, folds):
+    labels = np.array(dataset.labels)
+    skf = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+    os.makedirs(os.path.join(OUTPUT_DIR, 'cv'), exist_ok=True)
+
+    for fold, (tr_idx, te_idx) in enumerate(skf.split(np.zeros(len(labels)), labels)):
+        if fold not in folds:
+            continue
+        print(f"\n--- Fold {fold}: train {len(tr_idx)} | test {len(te_idx)} ---")
+        set_seed(RANDOM_SEED + fold)
+        weights = make_class_weights(labels[tr_idx], NUM_CLASSES)
+        model = build_model(NUM_CLASSES)
+        model = train_model(model, Subset(dataset, tr_idx), weights, device, epochs)
+        preds = predict(model, Subset(dataset, te_idx), device)
+        bal = balanced_accuracy_score(labels[te_idx], preds)
+        print(f"  fold {fold} balanced accuracy: {bal * 100:.2f}%")
+        json.dump({'fold': fold, 'balanced_accuracy': bal,
+                   'y_true': labels[te_idx].tolist(), 'y_pred': preds.tolist()},
+                  open(os.path.join(OUTPUT_DIR, 'cv', f'fold{fold}.json'), 'w'))
+        free_gpu(model)
+    return summarize_cv(len(labels))
+
+
+def run_family_full(dataset, tokenizer, device, epochs):
+    """Train on ALL samples and save - this is the model you deploy."""
+    labels = np.array(dataset.labels)
+    set_seed(RANDOM_SEED)
+    model = build_model(NUM_CLASSES)
+    model = train_model(model, dataset, make_class_weights(labels, NUM_CLASSES),
+                        device, epochs)
+    out = os.path.join(MODEL_SAVE, 'family', 'final')
+    os.makedirs(out, exist_ok=True)
+    model.save_pretrained(out)
+    tokenizer.save_pretrained(out)
+    print(f"Saved full family model -> {out}")
+
+
+# ------------------------------------------------------------
+# TASK 2: zero-day detection (seen/unseen family holdout)
+# ------------------------------------------------------------
+def zero_day_split(df):
+    fam = df['family'].values
+    rng = np.random.RandomState(RANDOM_SEED)
+    unseen_idx = np.where(np.isin(fam, UNSEEN_FAMILIES))[0]
+    seen_idx = np.where(np.isin(fam, SEEN_FAMILIES))[0]
+    good_idx = np.where(fam == 0)[0]
+    rng.shuffle(good_idx)
+    n = len(unseen_idx)                        # equal goodware in the test set
+    test_idx = np.concatenate([unseen_idx, good_idx[:n]])
+    train_idx = np.concatenate([seen_idx, good_idx[n:]])
+    return train_idx, test_idx
+
+
+def run_binary(dataset, tokenizer, device, epochs):
+    labels = np.array(dataset.labels)           # 0 goodware / 1 ransomware
+    fam = dataset.df['family'].values
+    train_idx, test_idx = zero_day_split(dataset.df)
+    print(f"Train: {len(train_idx)} ({int(labels[train_idx].sum())} ransomware, "
+          f"{int((labels[train_idx] == 0).sum())} goodware)")
+    print(f"Test:  {len(test_idx)} ({int(labels[test_idx].sum())} UNSEEN ransomware, "
+          f"{int((labels[test_idx] == 0).sum())} goodware)")
+
+    set_seed(RANDOM_SEED)
+    model = build_model(2)
+    model = train_model(model, Subset(dataset, train_idx),
+                        make_class_weights(labels[train_idx], 2), device, epochs)
+    preds = predict(model, Subset(dataset, test_idx), device)
+    y = labels[test_idx]
+
+    acc = accuracy_score(y, preds)
+    rec = recall_score(y, preds, zero_division=0)
+    prec = precision_score(y, preds, zero_division=0)
+    f1 = f1_score(y, preds, zero_division=0)
+
+    print("\n" + "=" * 60)
+    print("TASK 2 RESULTS (zero-day detection, unseen families)")
+    print("=" * 60)
+    print(f"Accuracy:  {acc * 100:.2f}%   (paper {PAPER_TASK2_ACCURACY * 100:.0f}%)")
+    print(f"Recall:    {rec * 100:.2f}%")
+    print(f"Precision: {prec * 100:.2f}%")
+    print(f"F1:        {f1 * 100:.2f}%   (paper {PAPER_TASK2_F1 * 100:.0f}%)")
+    per_fam = {}
+    for c in UNSEEN_FAMILIES:
+        m = fam[test_idx] == c
+        per_fam[FAMILY_MAP[c]] = round(float((preds[m] == 1).mean()), 4)
+    print("Detection rate per unseen family:", per_fam)
+    if acc > PAPER_TASK2_ACCURACY:
+        print("STATUS: BEATS PAPER")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    json.dump({'accuracy': acc, 'recall': rec, 'precision': prec, 'f1': f1,
+               'per_unseen_family_detection': per_fam},
+              open(os.path.join(OUTPUT_DIR, 'results_binary.json'), 'w'), indent=2)
+
+    out = os.path.join(MODEL_SAVE, 'binary', 'final')
+    os.makedirs(out, exist_ok=True)
+    model.save_pretrained(out)
+    tokenizer.save_pretrained(out)
+    print(f"Saved binary model -> {out}")
+
+
+# ------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--task', choices=['family', 'binary'], required=True)
+    ap.add_argument('--epochs', type=int, default=NUM_EPOCHS)
+    ap.add_argument('--folds', default=','.join(str(i) for i in range(CV_FOLDS)),
+                    help="comma-separated fold ids for the family task, e.g. 0,1")
+    ap.add_argument('--full', action='store_true',
+                    help="family task: train on all data and save the model")
+    ap.add_argument('--summarize', action='store_true',
+                    help="family task: pool saved fold results and exit")
+    args = ap.parse_args()
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}  | model: {MODEL_NAME}  | epochs: {args.epochs}")
+    if device.type == 'cpu':
+        print("WARNING: no GPU found - run this on Colab (Runtime > T4 GPU).")
+
+    if args.task == 'family' and args.summarize:
+        n = len(pd.read_csv(PROCESSED_CSV, usecols=['label']))
+        summarize_cv(n)
+        return
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    dataset = RansomwareDataset(PROCESSED_CSV, tokenizer, task=args.task)
 
-    # ── Step 2: Load dataset ──────────────────────────────────
-    print("[2/5] Loading dataset...")
-    dataset = RansomwareDataset(
-        csv_path  = "data/processed/processed.csv",
-        tokenizer = tokenizer,
-        task      = task,
-    )
+    if args.task == 'binary':
+        run_binary(dataset, tokenizer, device, args.epochs)
+    elif args.full:
+        run_family_full(dataset, tokenizer, device, args.epochs)
+    else:
+        folds = [int(f) for f in args.folds.split(',')]
+        run_family_cv(dataset, device, args.epochs, folds)
 
-    # Stratified train/val split
-    # WHAT STRATIFIED MEANS:
-    # Keeps same class proportions in train and val sets.
-    # Without stratification, PGPCODER (4 samples) might
-    # all end up in train set with none in val.
-    labels  = [dataset.df.iloc[i]['family'] for i in range(len(dataset))]
-    indices = list(range(len(dataset)))
-    train_idx, val_idx = train_test_split(
-        indices,
-        test_size    = 1 - TRAIN_SPLIT,
-        stratify     = labels,
-        random_state = RANDOM_SEED,
-    )
-    train_ds = Subset(dataset, train_idx)
-    val_ds   = Subset(dataset, val_idx)
-    print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
-    # ── Step 3: Load model ────────────────────────────────────
-    # WHY AutoModelForSequenceClassification:
-    # Takes DeBERTa-v3 and adds a classification head on top.
-    # The head is: Linear(768 → num_classes)
-    # DeBERTa [CLS] token → classification head → class scores
-    num_classes = NUM_CLASSES if task == 'family' else 2
-    print(f"[3/5] Loading DeBERTa-v3 ({num_classes} classes)...")
-    model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME,
-        num_labels = num_classes,
-        ignore_mismatched_sizes = True,
-    )
-
-    # ── Step 4: Training arguments ────────────────────────────
-    # WHY THESE SETTINGS:
-    # evaluation_strategy='epoch': evaluate after every epoch
-    # load_best_model_at_end: keep the epoch with best val accuracy
-    # fp16=True: use 16-bit floats → 2x faster on GPU, same accuracy
-    # warmup_ratio=0.1: slowly increase LR for first 10% of training
-    #   → prevents early instability
-    output_dir = f"{MODEL_SAVE}/{task}"
-    args = TrainingArguments(
-        output_dir              = output_dir,
-        num_train_epochs        = NUM_EPOCHS,
-        per_device_train_batch_size = BATCH_SIZE,
-        per_device_eval_batch_size  = BATCH_SIZE,
-        learning_rate           = LEARNING_RATE,
-        weight_decay            = WEIGHT_DECAY,
-        warmup_ratio            = WARMUP_RATIO,
-        evaluation_strategy     = "epoch",
-        save_strategy           = "epoch",
-        load_best_model_at_end  = True,
-        metric_for_best_model   = "balanced_accuracy",
-        greater_is_better       = True,
-        fp16                    = torch.cuda.is_available(),
-        logging_dir             = LOG_DIR,
-        logging_steps           = 50,
-        report_to               = "none",
-    )
-
-    # ── Step 5: Train ─────────────────────────────────────────
-    trainer = Trainer(
-        model           = model,
-        args            = args,
-        train_dataset   = train_ds,
-        eval_dataset    = val_ds,
-        compute_metrics = compute_metrics,
-        callbacks       = [
-            # Stop training if no improvement for 3 epochs
-            EarlyStoppingCallback(early_stopping_patience=3)
-        ],
-    )
-
-    print(f"[4/5] Training...")
-    print(f"GPU available: {torch.cuda.is_available()}")
-    trainer.train()
-
-    # ── Step 6: Save ──────────────────────────────────────────
-    print(f"[5/5] Saving model to {output_dir}/final...")
-    trainer.save_model(f"{output_dir}/final")
-    tokenizer.save_pretrained(f"{output_dir}/final")
-
-    # Final evaluation
-    results = trainer.evaluate()
-    print("\n" + "="*60)
-    print("FINAL RESULTS")
-    print("="*60)
-    print(f"Balanced Accuracy: {results['eval_balanced_accuracy']*100:.2f}%")
-    print(f"F1 Weighted:       {results['eval_f1_weighted']*100:.2f}%")
-    print(f"Paper target:      54.83%")
-    if results['eval_balanced_accuracy'] > 0.5483:
-        print("STATUS: BEATS PAPER!")
-    return results
-
-if __name__ == "__main__":
-    # Train family classifier (Task 1)
-    train(task='family')
-    # Train binary detector (Task 2)
-    train(task='binary')
+if __name__ == '__main__':
+    main()

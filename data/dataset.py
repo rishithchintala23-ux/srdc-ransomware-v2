@@ -1,129 +1,85 @@
 # ============================================================
-# dataset.py — PyTorch Dataset for DeBERTa fine-tuning
+# dataset.py - PyTorch Dataset for DeBERTa fine-tuning
 #
-# WHAT HAPPENS HERE:
-#   Input:  processed.csv (7 text columns per sample)
-#   Output: PyTorch tensors DeBERTa can train on
+# Each sample has 7 text groups (api, files, ext, reg, dir, drop, str).
+# Samples can be thousands of words long, but DeBERTa takes 512 tokens.
+# Plain concatenation + truncation would cut off the LAST groups
+# (drop, str) for most samples - and those carry strong ransomware signal
+# (dropped ransom notes, strings like "encrypt").
 #
-# WHY THIS DESIGN:
-#   DeBERTa takes text input → we combine all 7 categories
-#   into one string with special separators.
-#   This lets DeBERTa attend across ALL feature types at once.
+# Fix: every group gets its own token budget, so all 7 groups are
+# always represented in the final 512-token input.
 # ============================================================
 
+import os
+import sys
+
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
-import pandas as pd
-from transformers import AutoTokenizer
-from model.config import MODEL_NAME, MAX_LENGTH, FAMILY_MAP
 
-FEATURE_COLS = [
-    'apiFeatures', 'filesFeatures', 'filesExtFeatures',
-    'regFeatures', 'dirFeatures', 'dropFeatures', 'strFeatures'
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from model.config import MAX_LENGTH
+
+# (csv column, tag, max body tokens)
+# Budgets sum to 460; with tags + [CLS]/[SEP] this stays inside 512.
+GROUPS = [
+    ('apiFeatures',   'api',   110),
+    ('filesFeatures', 'files',  70),
+    ('extFeatures',   'ext',    20),
+    ('regFeatures',   'reg',    90),
+    ('dirFeatures',   'dir',    50),
+    ('dropFeatures',  'drop',   30),
+    ('strFeatures',   'str',    90),
 ]
-
-# Labels for readable display
-CAT_LABELS = {
-    'apiFeatures':      '[API]',
-    'filesFeatures':    '[FILES]',
-    'filesExtFeatures': '[EXT]',
-    'regFeatures':      '[REG]',
-    'dirFeatures':      '[DIR]',
-    'dropFeatures':     '[DROP]',
-    'strFeatures':      '[STR]',
-}
-
-def build_input_text(row: pd.Series) -> str:
-    """
-    Combine 7 feature categories into one DeBERTa input string.
-
-    WHY: DeBERTa's bidirectional attention means it can see
-    relationships ACROSS all feature types simultaneously.
-    Example: [API] crypt encrypt [FILES] opened doc.docx
-             [DROP] dropped READ_ME.txt
-    DeBERTa sees that crypt_encrypt + dropped READ_ME.txt
-    TOGETHER = strong ransomware signal.
-
-    Format:
-    [API] api text here [FILES] files text [REG] reg text ...
-    """
-    parts = []
-    for col in FEATURE_COLS:
-        text = str(row.get(col, 'no activity')).strip()
-        if not text or text == 'nan':
-            text = 'no activity'
-        label = CAT_LABELS.get(col, col)
-        parts.append(f"{label} {text}")
-    return ' '.join(parts)
 
 
 class RansomwareDataset(Dataset):
     """
-    PyTorch Dataset for ransomware detection.
-
-    HOW IT WORKS:
-    1. Load processed CSV
-    2. For each sample, combine 7 text columns → one string
-    3. Tokenize with DeBERTa tokenizer
-    4. Return: input_ids, attention_mask, label
-
-    WHAT __getitem__ RETURNS:
-    {
-        'input_ids':      tensor of token IDs [MAX_LENGTH]
-        'attention_mask': tensor of 1s/0s     [MAX_LENGTH]
-        'label':          integer (family class 0-11)
-        'binary_label':   integer (0=goodware, 1=ransomware)
-    }
+    Returns per item:
+      input_ids       [MAX_LENGTH]
+      attention_mask  [MAX_LENGTH]
+      label           family id (0-11) if task='family', else 0/1 if task='binary'
+      binary_label    0 = goodware, 1 = ransomware
     """
 
-    def __init__(self, csv_path: str, tokenizer, task: str = 'family'):
-        """
-        Args:
-            csv_path:  path to processed.csv
-            tokenizer: DeBERTa tokenizer
-            task:      'family' (12-class) or 'binary' (2-class)
-        """
-        self.df        = pd.read_csv(csv_path)
+    def __init__(self, csv_path, tokenizer, task='family'):
+        self.df = pd.read_csv(csv_path)
         self.tokenizer = tokenizer
-        self.task      = task
+        self.task = task
+        self.labels = (self.df['label'] if task == 'binary'
+                       else self.df['family']).astype(int).tolist()
 
-        # Build input texts once (saves time during training)
-        print(f"Building input texts for {len(self.df)} samples...")
-        self.texts = [
-            build_input_text(row)
-            for _, row in self.df.iterrows()
-        ]
-        print(f"Average text length: "
-              f"{sum(len(t) for t in self.texts)//len(self.texts)} chars")
+        print(f"Tokenizing {len(self.df)} samples (per-group budgets)...")
+        self.encoded = [self._encode_row(row) for _, row in self.df.iterrows()]
+
+    def _encode_row(self, row):
+        tok = self.tokenizer
+        ids = [tok.cls_token_id]
+        for col, tag, budget in GROUPS:
+            text = str(row.get(col, '')).strip()
+            if not text or text == 'nan':
+                text = 'no activity'
+            tag_ids = tok(tag + ':', add_special_tokens=False)['input_ids']
+            body = tok(text, add_special_tokens=False, truncation=True,
+                       max_length=budget)['input_ids']
+            ids += tag_ids + body
+        ids = ids[:MAX_LENGTH - 1] + [tok.sep_token_id]
+        mask = [1] * len(ids)
+        pad = MAX_LENGTH - len(ids)
+        ids += [tok.pad_token_id] * pad
+        mask += [0] * pad
+        return ids, mask
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        text  = self.texts[idx]
-        row   = self.df.iloc[idx]
-
-        # Tokenize
-        # truncation=True: cut if > MAX_LENGTH (DeBERTa limit)
-        # padding='max_length': pad shorter sequences to MAX_LENGTH
-        encoding = self.tokenizer(
-            text,
-            max_length    = MAX_LENGTH,
-            truncation    = True,
-            padding       = 'max_length',
-            return_tensors = 'pt'
-        )
-
-        label = (
-            int(row['label'])   # 0 or 1
-            if self.task == 'binary'
-            else int(row['family'])  # 0-11
-        )
-
+        ids, mask = self.encoded[idx]
+        row = self.df.iloc[idx]
         return {
-            'input_ids':      encoding['input_ids'].squeeze(0),
-            'attention_mask': encoding['attention_mask'].squeeze(0),
-            'label':          torch.tensor(label, dtype=torch.long),
-            'binary_label':   torch.tensor(int(row['label']),
-                                           dtype=torch.long),
+            'input_ids':      torch.tensor(ids, dtype=torch.long),
+            'attention_mask': torch.tensor(mask, dtype=torch.long),
+            'label':          torch.tensor(self.labels[idx], dtype=torch.long),
+            'binary_label':   torch.tensor(int(row['label']), dtype=torch.long),
         }
