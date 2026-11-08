@@ -59,25 +59,32 @@ def make_class_weights(labels, num_classes, power=CLASS_WEIGHT_POWER):
     w = (1.0 / counts) ** power
     return w / w.mean()
 
+
 def build_model(num_classes):
     model = AutoModelForSequenceClassification.from_pretrained(
         MODEL_NAME, num_labels=num_classes)
     return model.float()   # checkpoint is fp16; AMP needs fp32 master weights
 
+
 @torch.no_grad()
-def predict(model, dataset, device, batch_size=32):
+def predict_proba(model, dataset, device, batch_size=32):
+    """Softmax class probabilities, shape [N, num_classes]."""
     model.eval()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     use_amp = device.type == 'cuda'
-    preds = []
+    probs = []
     for batch in loader:
         ids = batch['input_ids'].to(device)
         mask = batch['attention_mask'].to(device)
         with torch.autocast(device_type=device.type, dtype=torch.float16,
                             enabled=use_amp):
             logits = model(input_ids=ids, attention_mask=mask).logits
-        preds.extend(logits.argmax(dim=-1).cpu().tolist())
-    return np.array(preds)
+        probs.append(torch.softmax(logits.float(), dim=-1).cpu().numpy())
+    return np.concatenate(probs, axis=0)
+
+
+def predict(model, dataset, device, batch_size=32):
+    return predict_proba(model, dataset, device, batch_size).argmax(axis=1)
 
 
 def train_model(model, train_ds, class_weights, device, epochs):
@@ -199,11 +206,14 @@ def run_family_cv(dataset, device, epochs, folds):
         weights = make_class_weights(labels[tr_idx], NUM_CLASSES)
         model = build_model(NUM_CLASSES)
         model = train_model(model, Subset(dataset, tr_idx), weights, device, epochs)
-        preds = predict(model, Subset(dataset, te_idx), device)
+        probs = predict_proba(model, Subset(dataset, te_idx), device)
+        preds = probs.argmax(axis=1)
         bal = balanced_accuracy_score(labels[te_idx], preds)
         print(f"  fold {fold} balanced accuracy: {bal * 100:.2f}%")
         json.dump({'fold': fold, 'balanced_accuracy': bal,
-                   'y_true': labels[te_idx].tolist(), 'y_pred': preds.tolist()},
+                   'y_true': labels[te_idx].tolist(), 'y_pred': preds.tolist(),
+                   'te_idx': te_idx.tolist(),
+                   'y_prob': np.round(probs, 5).tolist()},
                   open(os.path.join(OUTPUT_DIR, 'cv', f'fold{fold}.json'), 'w'))
         free_gpu(model)
     return summarize_cv(len(labels))
@@ -252,8 +262,12 @@ def run_binary(dataset, tokenizer, device, epochs):
     model = build_model(2)
     model = train_model(model, Subset(dataset, train_idx),
                         make_class_weights(labels[train_idx], 2), device, epochs)
-    preds = predict(model, Subset(dataset, test_idx), device)
+    probs = predict_proba(model, Subset(dataset, test_idx), device)
+    preds = probs.argmax(axis=1)
     y = labels[test_idx]
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    np.save(os.path.join(OUTPUT_DIR, 'deberta_test_probs.npy'), probs[:, 1])
+    np.save(os.path.join(OUTPUT_DIR, 'deberta_test_idx.npy'), test_idx)
 
     acc = accuracy_score(y, preds)
     rec = recall_score(y, preds, zero_division=0)
